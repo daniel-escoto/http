@@ -1,841 +1,622 @@
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <string.h>
-#include <err.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <stdint.h>
-#include <time.h>
+#include <arpa/inet.h>
+#include <ctype.h>
 #include <dirent.h>
-#include <string.h>
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <queue>
+#include <string>
+#include <vector>
 
-// this is for testing, remove before submitting
-#include <iostream>
-using namespace std;
+static const size_t BUFFER_SIZE = 8192;
 
-#define SIZE 100
-#define BUFFER_SIZE 8192
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_ready = PTHREAD_COND_INITIALIZER;
+static std::queue<int> client_queue;
 
-//initiliaize locks
-pthread_mutex_t mutexQue = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutexThread = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutexDispatch = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t mutexAvailable = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t condThread = PTHREAD_COND_INITIALIZER;
-pthread_cond_t condDispatch = PTHREAD_COND_INITIALIZER;
+struct ThreadData {
+        bool redundancy_enabled;
+};
 
-//global variables
-int32_t header = -1;
-std::queue<int32_t> headerQueue;
-int32_t availableThreads;
+struct Request {
+        std::string method;
+        std::string path;
+        std::vector<char> body;
+};
 
-int isValid(char* inputString) {
-        if (strlen(inputString) == 11) {
+static bool send_all(int fd, const char *data, size_t length) {
+        while (length > 0) {
+                ssize_t written = send(fd, data, length, 0);
+                if (written <= 0) {
+                        return false;
+                }
+                data += written;
+                length -= (size_t)written;
+        }
+        return true;
+}
 
-                char str[100];
-                strcpy(str, inputString);
+static bool send_all(int fd, const std::string &data) {
+        return send_all(fd, data.data(), data.size());
+}
 
-                for (int i = 1; str[i] != '\0'; i++) {
-                        if(!isalnum(str[i])) {
-                                return 0;
+static void send_response(int fd, int status, const char *reason,
+                          const std::string &body = "") {
+        char header[256];
+        int header_length = snprintf(header, sizeof(header),
+                                     "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\n\r\n",
+                                     status, reason, body.size());
+        if (header_length < 0 || (size_t)header_length >= sizeof(header)) {
+                return;
+        }
+        send_all(fd, header, (size_t)header_length);
+        if (!body.empty()) {
+                send_all(fd, body);
+        }
+}
+
+static bool is_valid_path(const std::string &path) {
+        if (path.size() != 11 || path[0] != '/') {
+                return false;
+        }
+        for (size_t i = 1; i < path.size(); ++i) {
+                if (!isalnum((unsigned char)path[i])) {
+                        return false;
+                }
+        }
+        return true;
+}
+
+static std::string resource_name(const std::string &path) {
+        if (!path.empty() && path[0] == '/') {
+                return path.substr(1);
+        }
+        return path;
+}
+
+static bool starts_with(const std::string &prefix, const char *value) {
+        return strncmp(value, prefix.c_str(), prefix.size()) == 0;
+}
+
+static bool ensure_directory(const std::string &path) {
+        if (mkdir(path.c_str(), S_IRWXU) == 0) {
+                return true;
+        }
+        return errno == EEXIST;
+}
+
+static bool write_file(const std::string &path, const std::vector<char> &body) {
+        int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        if (fd == -1) {
+                return false;
+        }
+
+        bool ok = true;
+        size_t offset = 0;
+        while (offset < body.size()) {
+                ssize_t written = write(fd, body.data() + offset, body.size() - offset);
+                if (written <= 0) {
+                        ok = false;
+                        break;
+                }
+                offset += (size_t)written;
+        }
+
+        close(fd);
+        return ok;
+}
+
+static bool read_file(const std::string &path, std::vector<char> *body) {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) {
+                return false;
+        }
+
+        body->clear();
+        char buffer[BUFFER_SIZE];
+        ssize_t bytes_read;
+        while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+                body->insert(body->end(), buffer, buffer + bytes_read);
+        }
+
+        close(fd);
+        return bytes_read == 0;
+}
+
+static bool copy_file(const std::string &dest, const std::string &src) {
+        std::vector<char> body;
+        return read_file(src, &body) && write_file(dest, body);
+}
+
+static bool send_file(int client_fd, const std::string &path) {
+        std::vector<char> body;
+        if (!read_file(path, &body)) {
+                if (access(path.c_str(), F_OK) == 0) {
+                        send_response(client_fd, 403, "Forbidden");
+                } else {
+                        send_response(client_fd, 404, "File Not Found");
+                }
+                return false;
+        }
+
+        char header[256];
+        int header_length = snprintf(header, sizeof(header),
+                                     "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n\r\n",
+                                     body.size());
+        if (header_length < 0 || (size_t)header_length >= sizeof(header)) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return false;
+        }
+
+        send_all(client_fd, header, (size_t)header_length);
+        if (!body.empty()) {
+                send_all(client_fd, body.data(), body.size());
+        }
+        return true;
+}
+
+static bool is_regular_resource_name(const char *name) {
+        std::string path = "/";
+        path += name;
+        return is_valid_path(path);
+}
+
+static void handle_backup(int client_fd) {
+        char timestamp[32];
+        snprintf(timestamp, sizeof(timestamp), "%ld", (long)time(NULL));
+
+        std::string backup_dir = "backup-";
+        backup_dir += timestamp;
+        if (!ensure_directory(backup_dir)) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return;
+        }
+
+        DIR *dir = opendir(".");
+        if (dir == NULL) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return;
+        }
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+                if (is_regular_resource_name(entry->d_name)) {
+                        std::string dest = backup_dir + "/" + entry->d_name;
+                        copy_file(dest, entry->d_name);
+                }
+        }
+        closedir(dir);
+
+        send_response(client_fd, 200, "OK");
+}
+
+static bool restore_from_directory(const std::string &backup_dir) {
+        DIR *dir = opendir(backup_dir.c_str());
+        if (dir == NULL) {
+                return false;
+        }
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+                if (is_regular_resource_name(entry->d_name)) {
+                        std::string src = backup_dir + "/" + entry->d_name;
+                        copy_file(entry->d_name, src);
+                }
+        }
+        closedir(dir);
+        return true;
+}
+
+static std::string most_recent_backup() {
+        DIR *dir = opendir(".");
+        if (dir == NULL) {
+                return "";
+        }
+
+        long newest = -1;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+                if (starts_with("backup-", entry->d_name)) {
+                        char *end = NULL;
+                        long timestamp = strtol(entry->d_name + strlen("backup-"), &end, 10);
+                        if (end != NULL && *end == '\0' && timestamp > newest) {
+                                newest = timestamp;
                         }
                 }
+        }
+        closedir(dir);
 
-                return 1;
+        if (newest < 0) {
+                return "";
+        }
+
+        char path[64];
+        snprintf(path, sizeof(path), "backup-%ld", newest);
+        return path;
+}
+
+static void handle_restore(int client_fd, const std::string &path) {
+        std::string backup_dir;
+        if (path == "/r") {
+                backup_dir = most_recent_backup();
+                if (backup_dir.empty()) {
+                        send_response(client_fd, 404, "File Not Found");
+                        return;
+                }
+        } else if (path.rfind("/r/", 0) == 0) {
+                backup_dir = "backup-" + path.substr(3);
         } else {
-                return 0;
+                send_response(client_fd, 400, "Bad Request");
+                return;
         }
+
+        if (!restore_from_directory(backup_dir)) {
+                if (access(backup_dir.c_str(), F_OK) == 0) {
+                        send_response(client_fd, 403, "Forbidden");
+                } else {
+                        send_response(client_fd, 404, "File Not Found");
+                }
+                return;
+        }
+
+        send_response(client_fd, 200, "OK");
 }
 
-// parses arguments to see if redundancy is requested
-int isRedundant(int argc, char *argv[]) {
-        for (int i = 1; i < argc; i++) {
-                if (strcmp(argv[i], "-r") == 0) {
-                        *argv[i] = '\0';
-                        return 1;
+static void handle_list_backups(int client_fd) {
+        DIR *dir = opendir(".");
+        if (dir == NULL) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return;
+        }
+
+        std::vector<std::string> backups;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+                if (starts_with("backup-", entry->d_name)) {
+                        backups.push_back(entry->d_name + strlen("backup-"));
                 }
         }
-        
-        return 0;
+        closedir(dir);
+
+        std::sort(backups.begin(), backups.end());
+
+        std::string body;
+        for (size_t i = 0; i < backups.size(); ++i) {
+                body += backups[i];
+                body += "\n";
+        }
+        send_response(client_fd, 200, "OK", body);
 }
 
-// parses arguments for thread number
-int threadNumber(int argc, char *argv[]) {
-    for (int i = 1; i < argc; i++) {
-                if (strcmp(argv[i], "-N") == 0) {
-                        if (const char *str = argv[i+1]) {
-                            int x;
-                            sscanf(str, "%d", &x);
-                            *argv[i] = '\0';
-                            *argv[i+1] = '\0';
-                            return x;
-                        } else {
-                            *argv[i] = '\0';
-                            return 4;
+static bool redundancy_paths(const std::string &name, std::vector<std::string> *paths) {
+        if (!ensure_directory("copy1") || !ensure_directory("copy2") ||
+            !ensure_directory("copy3")) {
+                return false;
+        }
+
+        paths->clear();
+        paths->push_back("copy1/" + name);
+        paths->push_back("copy2/" + name);
+        paths->push_back("copy3/" + name);
+        return true;
+}
+
+static void handle_put(int client_fd, const Request &request, bool redundancy_enabled) {
+        if (!is_valid_path(request.path)) {
+                send_response(client_fd, 400, "Bad Request");
+                return;
+        }
+
+        std::string name = resource_name(request.path);
+        if (redundancy_enabled) {
+                std::vector<std::string> paths;
+                if (!redundancy_paths(name, &paths)) {
+                        send_response(client_fd, 500, "Internal Server Error");
+                        return;
+                }
+
+                for (size_t i = 0; i < paths.size(); ++i) {
+                        if (!write_file(paths[i], request.body)) {
+                                send_response(client_fd, 500, "Internal Server Error");
+                                return;
                         }
                 }
-        }   
-        
+        } else if (!write_file(name, request.body)) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return;
+        }
+
+        send_response(client_fd, 200, "OK");
+}
+
+static void handle_redundant_get(int client_fd, const std::string &name) {
+        std::vector<std::string> paths;
+        if (!redundancy_paths(name, &paths)) {
+                send_response(client_fd, 500, "Internal Server Error");
+                return;
+        }
+
+        std::vector<char> copy1;
+        std::vector<char> copy2;
+        std::vector<char> copy3;
+        if (!read_file(paths[0], &copy1) || !read_file(paths[1], &copy2) ||
+            !read_file(paths[2], &copy3)) {
+                send_response(client_fd, 404, "File Not Found");
+                return;
+        }
+
+        if (copy1 == copy2 || copy1 == copy3) {
+                send_response(client_fd, 200, "OK",
+                              std::string(copy1.begin(), copy1.end()));
+        } else if (copy2 == copy3) {
+                send_response(client_fd, 200, "OK",
+                              std::string(copy2.begin(), copy2.end()));
+        } else {
+                send_response(client_fd, 500, "Internal Server Error");
+        }
+}
+
+static void handle_get(int client_fd, const Request &request, bool redundancy_enabled) {
+        if (request.path == "/b") {
+                handle_backup(client_fd);
+                return;
+        }
+        if (request.path == "/r" || request.path.rfind("/r/", 0) == 0) {
+                handle_restore(client_fd, request.path);
+                return;
+        }
+        if (request.path == "/l") {
+                handle_list_backups(client_fd);
+                return;
+        }
+        if (!is_valid_path(request.path)) {
+                send_response(client_fd, 400, "Bad Request");
+                return;
+        }
+
+        std::string name = resource_name(request.path);
+        if (redundancy_enabled) {
+                handle_redundant_get(client_fd, name);
+                return;
+        }
+
+        send_file(client_fd, name);
+}
+
+static bool parse_content_length(const std::string &headers, size_t *content_length) {
+        std::string key = "Content-Length:";
+        size_t pos = headers.find(key);
+        if (pos == std::string::npos) {
+                *content_length = 0;
+                return true;
+        }
+
+        pos += key.size();
+        while (pos < headers.size() && isspace((unsigned char)headers[pos])) {
+                ++pos;
+        }
+
+        char *end = NULL;
+        unsigned long parsed = strtoul(headers.c_str() + pos, &end, 10);
+        if (end == headers.c_str() + pos) {
+                return false;
+        }
+
+        *content_length = (size_t)parsed;
+        return true;
+}
+
+static bool read_request(int client_fd, Request *request) {
+        std::string raw;
+        char buffer[BUFFER_SIZE];
+        size_t header_end = std::string::npos;
+
+        while (header_end == std::string::npos) {
+                ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
+                if (bytes_read <= 0) {
+                        return false;
+                }
+                raw.append(buffer, (size_t)bytes_read);
+                header_end = raw.find("\r\n\r\n");
+                if (raw.size() > 65536) {
+                        return false;
+                }
+        }
+
+        std::string headers = raw.substr(0, header_end);
+        size_t body_start = header_end + 4;
+
+        size_t first_line_end = headers.find("\r\n");
+        std::string request_line = headers.substr(0, first_line_end);
+        size_t method_end = request_line.find(' ');
+        size_t path_end = request_line.find(' ', method_end + 1);
+        if (method_end == std::string::npos || path_end == std::string::npos) {
+                return false;
+        }
+
+        request->method = request_line.substr(0, method_end);
+        request->path = request_line.substr(method_end + 1, path_end - method_end - 1);
+
+        size_t content_length = 0;
+        if (!parse_content_length(headers, &content_length)) {
+                return false;
+        }
+
+        if (raw.size() > body_start) {
+                request->body.assign(raw.begin() + body_start, raw.end());
+        } else {
+                request->body.clear();
+        }
+
+        while (request->body.size() < content_length) {
+                size_t remaining = content_length - request->body.size();
+                ssize_t bytes_read = recv(client_fd, buffer,
+                                          std::min(sizeof(buffer), remaining), 0);
+                if (bytes_read <= 0) {
+                        return false;
+                }
+                request->body.insert(request->body.end(), buffer, buffer + bytes_read);
+        }
+
+        if (request->body.size() > content_length) {
+                request->body.resize(content_length);
+        }
+
+        return true;
+}
+
+static void handle_client(int client_fd, bool redundancy_enabled) {
+        Request request;
+        if (!read_request(client_fd, &request)) {
+                send_response(client_fd, 400, "Bad Request");
+                return;
+        }
+
+        if (request.method == "GET") {
+                handle_get(client_fd, request, redundancy_enabled);
+        } else if (request.method == "PUT") {
+                handle_put(client_fd, request, redundancy_enabled);
+        } else {
+                send_response(client_fd, 501, "Not Implemented");
+        }
+}
+
+static bool arg_present(int argc, char *argv[], const char *flag) {
+        for (int i = 1; i < argc; ++i) {
+                if (strcmp(argv[i], flag) == 0) {
+                        return true;
+                }
+        }
+        return false;
+}
+
+static int thread_count(int argc, char *argv[]) {
+        for (int i = 1; i + 1 < argc; ++i) {
+                if (strcmp(argv[i], "-N") == 0) {
+                        int count = atoi(argv[i + 1]);
+                        return count > 0 ? count : 4;
+                }
+        }
         return 4;
 }
 
-// parses arguments to find requested address
-char* findAddress(int argc, char *argv[]) {
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "") != 0) {
-            return argv[i];
+static std::vector<std::string> positional_args(int argc, char *argv[]) {
+        std::vector<std::string> args;
+        for (int i = 1; i < argc; ++i) {
+                if (strcmp(argv[i], "-r") == 0) {
+                        continue;
+                }
+                if (strcmp(argv[i], "-N") == 0) {
+                        ++i;
+                        continue;
+                }
+                args.push_back(argv[i]);
         }
-    }
-    return (char*)"localhost";
+        return args;
 }
 
-// parses arguments to find requested port
-unsigned short findPort(int argc, char *argv[]) {
-    int passedAddress = 0;
-    for (int i = 1; i < argc; i++) {
-        if ((strcmp(argv[i], "") != 0) && passedAddress == 0) {
-            passedAddress = 1;
-        }else if ((strcmp(argv[i], "") != 0) && passedAddress == 1) {
-            return (unsigned short) strtoul(argv[i], NULL, 0);
-        }
-    }
-    
-    return 80;
-}
-
-int compCounter (int cmp12, int cmp13, int cmp23) {
-        int count = 0;
-        if (cmp12 == 0) {
-                count++;
-        }
-        if (cmp13 == 0) {
-                count++;
-        }
-        if (cmp23 == 0) {
-                count++;
-        }
-        return count;
-}
-
-//function that returns the length of a file
-long filelength(const char* filpath){
-        struct stat st;
-        if(stat(filpath, &st))
-                return -1;
-        return (long) st.st_size;
-}
-
-int recv_all(int socket, void *buffer, size_t length) {
-        char *ptr = (char*) buffer;
-        while (length > 0)  {
-                int i = recv(socket, ptr, length, 0);
-                if (i < 1) return 0;
-                ptr += i;
-                length -= i;
-        }
-        return 1;
-}
-
-bool startsWith(const char *pre, const char *str)
-{
-        size_t lenpre = strlen(pre),
-               lenstr = strlen(str);
-        return lenstr < lenpre ? false : memcmp(pre, str, lenpre) == 0;
-}
-
-int isForbidden(char* path) {
-        if(access(path, F_OK) == 0) {
-                int fd = open(path, O_RDWR);
-                if(fd == -1) {
-                        return 1;
-                }
-                close(fd);
-        }
-        return 0;
-}
-
-// copies contents of file located at srcpath, and
-// makes a new file at destpath
-int copyTo(char* destpath, char* srcpath) {
-        int dest_fd, src_fd;
-        int32_t readBytes = 0;
-        size_t length = filelength(srcpath);
-        char *buffer = (char*)malloc(length);
-
-        src_fd = open(srcpath, O_RDWR);
-        
-        if (src_fd > -1) {
-                readBytes = read(src_fd,buffer,length);
-
-                dest_fd = open(destpath, O_RDWR | O_CREAT | O_TRUNC, S_IRWXU);
-        }
-
-
-
-        if (dest_fd == -1 || src_fd == -1) {
-                return -1;
-        }
-
-        while(readBytes > 0) {
-                int32_t writeTo = write(dest_fd, buffer, readBytes);
-                readBytes = read(src_fd, buffer, length);
-        }
-
-        close(dest_fd);
-        close(src_fd);
-        free(buffer);
-        return 0;
-}
-
-void doPut(char file[15], int header, int contentLength, int redundancyStatus = 0) {
-
-        char *token;
-        char head[100];
-        char *badRequest = (char*)"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        char *okRequest = (char*)"HTTP/1.1 200 OK\r\nContent-Length:";
-        char fileName[BUFFER_SIZE];
-
-        // send error if file name is not long enough
-        if (!isValid(file)) {
-                sprintf(head, badRequest, strlen(badRequest), 0);
-                send(header, head, strlen(head), 0);
-                return;
-        }
-
-        // get token
-        strcpy(fileName, file);
-        token = strtok(fileName, "/");
-
-        // send file contents to buffer
-        char *buffer = (char*)malloc(contentLength);
-        recv_all(header, buffer, contentLength);
-
-        if (redundancyStatus == 1) {
-                int copy1_fd;
-                int copy2_fd;
-                int copy3_fd;
-
-                // assign copy file discriptors.
-                char *copy1Token = new char[50];
-                char *copy2Token = new char[50];
-                char *copy3Token = new char[50];
-
-                strcpy(copy1Token, "copy1/");
-                strcpy(copy2Token, "copy2/");
-                strcpy(copy3Token, "copy3/");
-
-                strcat(copy1Token, token);
-                strcat(copy2Token, token);
-                strcat(copy3Token, token);
-
-                // chdir("/copy1");
-
-                if((copy1_fd = open(copy1Token, O_WRONLY | O_CREAT | O_TRUNC,
-                 S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1) {
-                         perror("Cannot open output file\n");
-                         exit(1);
-                }
-
-                if((copy2_fd = open(copy2Token, O_WRONLY | O_CREAT | O_TRUNC,
-                 S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1) {
-                         perror("Cannot open output file\n");
-                         exit(1);
-                }
-
-                if((copy3_fd = open(copy3Token, O_WRONLY | O_CREAT | O_TRUNC,
-                 S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1) {
-                         perror("Cannot open output file\n");
-                         exit(1);
-                }
-                
-                write(copy1_fd, buffer, contentLength);
-                write(copy2_fd, buffer, contentLength);
-                write(copy3_fd, buffer, contentLength);
-
-                // buffer to new files
-
-                close(copy1_fd);
-                close(copy2_fd);
-                close(copy3_fd);
-
-                free(buffer);
-        } else {
-                // create new file
-                int dest_fd;
-                // dest_fd = open(token, O_CREAT | O_RDWR, S_IRWXU);
-                if((dest_fd = open(token, O_WRONLY | O_CREAT | O_TRUNC,
-                                S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1) {
-                        perror("Cannot open output file\n");
-                        exit(1);
-                }
-
-                write(dest_fd, buffer, contentLength);
-
-                // free, close
-                free(buffer);
-                close(dest_fd);            
-        }
-
-        // create new file
-        int dest_fd;
-        // dest_fd = open(token, O_CREAT | O_RDWR, S_IRWXU);
-        if((dest_fd = open(token, O_WRONLY | O_CREAT | O_TRUNC,
-                           S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1) {
-                perror("Cannot open output file\n");
-                exit(1);
-        }
-
-        // return okRequest
-        sprintf(head, "%s %d\r\n\r\n",  okRequest, contentLength);
-        send(header, head, strlen(head), 0);
-
-        return;
-
-}
-
-void doGet(char file[15], int header, int redundancyStatus = 0) {
-        int fd;
-        char *token;
-        char *buffer = (char*)malloc(32768);
-        char *badRequest = (char*)"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        char *fileNotFound = (char*)"HTTP/1.1 404 File Not Found\r\nContent-Length: 0\r\n\r\n";
-        char *okRequest = (char*)"HTTP/1.1 200 OK\r\nContent-Length:";
-        char *forbiddenRequest = (char*)"HTTP/1.1 403 Forbidden\r\nContent-Length:";
-        char head[100];
-        char fileName[BUFFER_SIZE];
-
-        strcpy(fileName, file);
-        token = strtok(fileName, "/");
-        std::string tokenString(token);
-        long contentLength = filelength(token);
-        if(tokenString == "b") {
-
-                // get timestamp
-                int timestamp = (int)time(NULL);
-
-                // convert timestamp to string
-                char timestampStr[10];
-                sprintf(timestampStr,"%d", timestamp);
-
-                // make timestamp directory
-                char dirName[100];
-
-                strcpy(dirName, "backup-");
-                strcat(dirName, timestampStr);
-
-                mkdir(dirName, S_IRWXU);
-
-                // iterate through files in directory
-                DIR *dir;
-                struct dirent *sd;
-                dir = opendir(".");
-                if (dir == NULL) {
-                        printf("Error! Unable to open directory.\n");
-                        sprintf(head, "HTTP/1.1 500 Internal Server Error\"3\"\r\nContent Length: 0\r\n\r\n");
-                        send(header, head, strlen(head), 0);
-                        exit(1);
-                }
-
-                char dashToken[11];
-                char pathStr[100];
-                strcpy(pathStr, dirName);
-                while((sd=readdir(dir)) != NULL) {
-                        strcpy(dashToken, "/");
-                        if (isValid(strcat(dashToken, sd->d_name))) {
-                                char tempDest[100];
-                                strcpy(tempDest, pathStr);
-                                strcat(tempDest, "/");
-                                strcat(tempDest, sd->d_name);
-
-                                copyTo(tempDest, sd->d_name);
-
-                        }
-
-                }
-                closedir(dir);
-                sprintf(head, "%s %ld\r\n\r\n",  okRequest, (long)0);
-                send(header, head, strlen(head), 0);
-                return;
-
-        }
-        if(tokenString == "r") {
-                // find most recent timestamp
-
-                if(strcmp(file, "/r") == 0) {
-                        DIR *dir;
-                        struct dirent *sd;
-                        dir = opendir(".");
-                        if (dir == NULL) {
-                                printf("Error! Unable to open directory.\n");
-                                sprintf(head, badRequest, strlen(badRequest), 0);
-                                send(header, head, strlen(head), 0);
-                                exit(1);
-                        }
-
-                        int largest = 0;
-
-                        while((sd=readdir(dir)) != NULL) {
-                                if(startsWith("backup-", sd->d_name)) {
-                                        char *last = strrchr(sd->d_name, '-') + 1;
-
-                                        if (atoi(last) > largest) {
-                                                largest = atoi(last);
-                                        }
-                                }
-                        }
-
-                        // convert int largest back to path
-                        char backupFolderPath[100];
-                        strcpy(backupFolderPath, "backup-");
-                        char numBuffer[15];
-                        sprintf(numBuffer, "%d", largest);
-                        strcat(backupFolderPath, numBuffer);
-
-                        printf("forbidden status: %d\n", isForbidden(backupFolderPath));
-                        if (isForbidden(backupFolderPath)) {
-                                sprintf(head, forbiddenRequest, strlen(forbiddenRequest), 0);
-                                send(header, head, strlen(head), 0);
-                                exit(1);                               
-                        }
-
-                        // access files in backup
-                        dir = opendir(backupFolderPath);
-                        if (dir == NULL) {
-                                printf("Error! Unable to open directory.\n");
-                                sprintf(head, fileNotFound, strlen(fileNotFound), 0);
-                                send(header, head, strlen(head), 0);
-                                exit(1);
-                        }
-
-                        char dashToken[25];
-                        while((sd = readdir(dir)) != NULL) {
-                                strcpy(dashToken, "/");
-                                if (isValid(strcat(dashToken, sd->d_name))) {
-                                        // copy file to main directory
-                                        char srcPath[100];
-                                        strcpy(srcPath, backupFolderPath);
-                                        strcat(srcPath, "/");
-                                        strcat(srcPath, sd->d_name);
-
-                                        copyTo(sd->d_name, srcPath);
-                                }
-                        }
-                } else {
-                        char *number = strrchr(file, '/') + 1;
-
-                        // check if requested backup exists
-                        char backupFolderPath[100];
-                        strcpy(backupFolderPath, "backup-");
-                        strcat(backupFolderPath, number);
-
-                        DIR *dir;
-                        struct dirent *sd;
-
-                        if (isForbidden(backupFolderPath)) {
-                                sprintf(head, forbiddenRequest, strlen(forbiddenRequest), 0);
-                                send(header, head, strlen(head), 0);
-                                exit(1);                               
-                        }
-
-                        dir = opendir(backupFolderPath);
-                        if (dir == NULL) {
-                                printf("Error! Unable to open directory.\n");
-                                sprintf(head, badRequest, strlen(badRequest), 0);
-                                send(header, head, strlen(head), 0);
-                                exit(1);
-                        }
-
-                        char dashToken[25];
-                        while((sd = readdir(dir)) != NULL) {
-                                strcpy(dashToken, "/");
-                                if (isValid(strcat(dashToken, sd->d_name))) {
-                                        // copy file to main directory
-                                        char srcPath[100];
-                                        strcpy(srcPath, backupFolderPath);
-                                        strcat(srcPath, "/");
-                                        strcat(srcPath, sd->d_name);
-
-                                        copyTo(sd->d_name, srcPath);
-                                }
-                        }
-
-                }
-
-                long contentLength = 0;
-
-                sprintf(head, "%s %ld\r\n\r\n",  okRequest, (long)0);
-                send(header, head, strlen(head), 0);
-                return;
-
-        }
-        if(tokenString =="l") {
-                char returnBuffer[1000];
-                memset(returnBuffer, '\0', 1000);
-                int counter = 0;
-                DIR *dir;
-                struct dirent *sd;
-                dir = opendir(".");
-                if (dir == NULL) {
-                        printf("Error! Unable to open directory.\n");
-                        sprintf(head, "HTTP/1.1 500 Internal Server Error\"3\"\r\nContent Length: 0\r\n\r\n");
-                        send(header, head, strlen(head), 0);
-                        exit(1);
-                }
-                while((sd=readdir(dir)) != NULL) {
-                        if(startsWith("backup-", sd->d_name)) {
-
-                                char *last = strrchr(sd->d_name, '-') + 1;
-                                strcat(returnBuffer, last);
-                                strcat(returnBuffer, "\n");
-
-                                counter++;
-                        }
-                }
-                // get length of used returnBuffer
-                int contentLength = 0;
-                for (int i = 0; returnBuffer[i] != '\0'; i++) {
-                        contentLength++;
-                }
-
-                sprintf(head, "%s %d\r\n\r\n",  okRequest, contentLength);
-                send(header, head, strlen(head), 0);
-                
-                int32_t readBytes = contentLength;
-                while (readBytes > 0) {
-                        int32_t writeTo = write(header, returnBuffer, readBytes);
-                        readBytes = readBytes - writeTo;
-                }
-                free(buffer);
-                close(fd);
-                return;
-        }
-        
-
-        //make sure that file length is long enough
-        if(!isValid(file)) {
-                sprintf(head, badRequest, strlen(badRequest), 0);
-                send(header, head, strlen(head), 0);
-                return;
-        }
-
-        if (redundancyStatus == 1) {
-
-                // check that the three files exist
-                char *copy1Token = new char[50];
-                char *copy2Token = new char[50];
-                char *copy3Token = new char[50];
-
-                strcpy(copy1Token, "copy1/");
-                strcpy(copy2Token, "copy2/");
-                strcpy(copy3Token, "copy3/");
-
-                strcat(copy1Token, token);
-                strcat(copy2Token, token);
-                strcat(copy3Token, token);
-
-
-                if ((access(copy1Token, F_OK) != 0) || (access(copy2Token, F_OK) != 0)
-                        || (access(copy3Token, F_OK) != 0)) {
-                                sprintf(head, fileNotFound, strlen(fileNotFound), 0);
-                                send(header, head, strlen(head), 0);
-                                return; 
-                        }
-                
-                
-
-                // set file descriptors
-                int copy1fd = open(copy1Token, O_RDWR);
-                int copy2fd = open(copy2Token, O_RDWR);
-                int copy3fd = open(copy3Token, O_RDWR);
-
-                // write file contents to their respective buffers
-                char *copy1Buffer = (char*)malloc(32768);
-                char *copy2Buffer = (char*)malloc(32768);
-                char *copy3Buffer = (char*)malloc(32768);
-
-                int32_t readBytes1 = read(copy1fd,copy1Buffer,32768);
-                int32_t readBytes2 = read(copy2fd,copy2Buffer,32768);
-                int32_t readBytes3 = read(copy3fd,copy3Buffer,32768);
-
-                // create comparators; 0 = both buffers are equal
-                int cmp12 = strcmp(copy1Buffer, copy2Buffer);
-                int cmp13 = strcmp(copy1Buffer, copy3Buffer);
-                int cmp23 = strcmp(copy2Buffer, copy3Buffer);
-
-                int equalCount = compCounter(cmp12, cmp13, cmp23);
-
-                printf("equalCount: %d\n", equalCount);
-
-                // all three files have the same file
-                if (equalCount == 3) {
-
-                        // send okay message
-                        sprintf(head, "%s %ld\r\n\r\n",  okRequest, filelength(copy1Token));
-                        send(header, head, strlen(head), 0);
-
-                        // if all files are the same, return first file contents
-                        printf("the same\n");
-                        while(readBytes1 > 0) {
-                                //while readBytes still has stuff in it, write its contents to output
-                                // write writes up to (3) bytes from (2) to (1)
-                                int32_t writeTo = write(header, copy1Buffer, readBytes1);
-                                readBytes1 = read(copy1fd, copy1Buffer, 32768);
-                                //checks to see if there are anymore bytes in fd
-                        }
-                } else if(equalCount == 1) {
-                        // only two files match
-                        if ((cmp12 == 0) || (cmp13 == 0)) {
-                                // if either copy1 and copy2 match, or copy1 and 
-                                // copy3 match, return contents of copy1
-
-                                // send okay message
-                                sprintf(head, "%s %ld\r\n\r\n",  okRequest, filelength(copy1Token));
-                                send(header, head, strlen(head), 0);
-
-                                // return first file contents
-                                printf("one is different, printing file1\n");
-                                while(readBytes1 > 0) {
-                                        //while readBytes still has stuff in it, write its contents to output
-                                        // write writes up to (3) bytes from (2) to (1)
-                                        int32_t writeTo = write(header, copy1Buffer, readBytes1);
-                                        readBytes1 = read(copy1fd, copy1Buffer, 32768);
-                                        //checks to see if there are anymore bytes in fd
-                                }
-                        } else {
-                                // this means cmp23 == 0 and the contents of file 3 should be printed
-                                // send okay message
-                                sprintf(head, "%s %ld\r\n\r\n",  okRequest, filelength(copy3Token));
-                                send(header, head, strlen(head), 0);
-
-                                // return first file contents
-                                printf("one is different, printing file3\n");
-                                while(readBytes3 > 0) {
-                                        //while readBytes still has stuff in it, write its contents to output
-                                        // write writes up to (3) bytes from (2) to (1)
-                                        int32_t writeTo = write(header, copy3Buffer, readBytes3);
-                                        readBytes3 = read(copy1fd, copy3Buffer, 32768);
-                                        //checks to see if there are anymore bytes in fd
-                                }
-                        }
-                } else {
-                        // all files are different
-                        sprintf(head, "HTTP/1.1 500 Internal Server Error\"3\"\r\nContent Length: 0\r\n\r\n");
-                        send(header, head, strlen(head), 0);
-                }
-
-                
-
-                free(copy1Buffer);
-                free(copy2Buffer);
-                free(copy3Buffer);
-
-                close(copy1fd);
-                close(copy2fd);
-                close(copy3fd);
-
-        } else {
-                             
-                char *buffer = (char*)malloc(32768);
-
-                //check if file exists
-                if(access(token, F_OK) == 0) {
-                        //from dog to open file
-                        fd = open(token, O_RDWR);
-                        //see if the file doesnt exsist
-                        if(fd == -1) {
-                                sprintf(head, forbiddenRequest, strlen(forbiddenRequest), 0);
-                                send(header, head, strlen(head), 0);
-                                return;
-                        }
-                }else{
-                        //it doesnt exsist
-                        sprintf(head, fileNotFound, strlen(fileNotFound), 0);
-                        send(header, head, strlen(head), 0);
-                        return;
-                }
-                sprintf(head, "%s %ld\r\n\r\n",  okRequest, contentLength);
-                send(header, head, strlen(head), 0);
-                //print from dog
-                // read reads up to (3) bytes from (1) to (2)
-                int32_t readBytes = read(fd,buffer,32768);
-                while(readBytes > 0) {
-                        //while readBytes still has stuff in it, write its contents to output
-                        // write writes up to (3) bytes from (2) to (1)
-                        int32_t writeTo = write(header, buffer, readBytes);
-                        readBytes = read(fd, buffer, 32768);
-                        //checks to see if there are anymore bytes in fd
-                }
-                free(buffer);
-                close(fd);
-        }
-
-
-        return;
-
-}
-
-
-void parse_header(int header, int redundancyStatus) {
-        char *buffer = (char*)malloc(32768);
-        char command[10];
-        char file[15];
-        char head[55];
-        int32_t readHeader = read(header,buffer,32768);
-        int contentLength;
-        char *lengthPtr;
-
-        sscanf(buffer, "%s %s", command, file);
-        if(strcmp(command,"GET")==0) {
-                doGet(file, header);
-        }else if(strcmp(command,"PUT")==0) {
-                lengthPtr = strstr(buffer, "Content-Length:");
-                sscanf(lengthPtr, "Content-Length: %d", &contentLength);
-                doPut(file, header, contentLength);
-        } else {
-                sprintf(head, "HTTP/1.1 500 Internal Server Error\"3\"\r\nContent Length: 0\r\n\r\n");
-                send(header, head, strlen(head), 0);
-        }
-        free(buffer);
-        return;
-}
-
-/*
-   getaddr returns the numerical representation of the address
-   identified by *name* as required for an IPv4 address represented
-   in a struct sockaddr_in.
- */
-//code from danial posted on piazza
-unsigned long getaddr(char *name) {
-        unsigned long res;
+static unsigned long getaddr(const char *name) {
         struct addrinfo hints;
-        struct addrinfo* info;
+        struct addrinfo *info;
 
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = AF_INET;
         if (getaddrinfo(name, NULL, &hints, &info) != 0 || info == NULL) {
-                char msg[] = "getaddrinfo(): address identification error\n";
-                write(STDERR_FILENO, msg, strlen(msg));
-                exit(1);
+                errx(1, "getaddrinfo(): address identification error");
         }
-        res = ((struct sockaddr_in*) info->ai_addr)->sin_addr.s_addr;
+
+        unsigned long result = ((struct sockaddr_in *)info->ai_addr)->sin_addr.s_addr;
         freeaddrinfo(info);
-        return res;
+        return result;
 }
 
-struct thread_data{
-        int redundancyStatus;
-};
+static void *worker_thread(void *arg) {
+        ThreadData *data = (ThreadData *)arg;
 
-// thread function that does stuff
-void* worker_thread(void* arg) {
+        while (true) {
+                pthread_mutex_lock(&queue_mutex);
+                while (client_queue.empty()) {
+                        pthread_cond_wait(&queue_ready, &queue_mutex);
+                }
 
-        struct thread_data *my_data;
+                int client_fd = client_queue.front();
+                client_queue.pop();
+                pthread_mutex_unlock(&queue_mutex);
 
-        my_data = (struct thread_data *) arg;
-
-        int redundancyStatus = my_data->redundancyStatus;
-
-        long not_used = (long)header;
-        not_used++;
-
-        while(1) {
-                pthread_cond_wait(&condThread, &mutexThread);
-                pthread_mutex_lock(&mutexAvailable);
-                availableThreads--;
-
-                pthread_mutex_unlock(&mutexAvailable);
-                pthread_mutex_lock(&mutexQue);
-
-                int32_t front = headerQueue.front();
-                printf("%d\n", front);
-
-                headerQueue.pop();
-                pthread_mutex_unlock(&mutexQue);
-
-                parse_header(front, redundancyStatus);
-
-                pthread_mutex_lock(&mutexAvailable);
-                availableThreads++;
-                pthread_mutex_unlock(&mutexAvailable);
-                pthread_cond_signal(&condDispatch);
+                handle_client(client_fd, data->redundancy_enabled);
+                close(client_fd);
         }
-        
+
+        return NULL;
 }
 
 int main(int argc, char *argv[]) {
-
-        if(argc < 2) {
-                warn("%s", "Please put an address");
-                return 0;
+        std::vector<std::string> args = positional_args(argc, argv);
+        if (args.empty()) {
+                warnx("usage: %s <hostname> <portNumber> [-r] [-N threadCount]", argv[0]);
+                return 1;
         }
 
-        // redundancy
-        int redundancyStatus = isRedundant(argc, argv);
-        // thread number
-        int threadCount = threadNumber(argc, argv);
-        // address
-        char* address = findAddress(argc, argv);
-        // port
-        unsigned short port = findPort(argc, argv);
+        const char *address = args[0].c_str();
+        unsigned short port = args.size() > 1 ? (unsigned short)strtoul(args[1].c_str(), NULL, 10) : 80;
+        bool redundancy_enabled = arg_present(argc, argv, "-r");
+        int workers = thread_count(argc, argv);
+
+        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) {
+                err(1, "socket()");
+        }
+
+        int reuse = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
         struct sockaddr_in servaddr;
         memset(&servaddr, 0, sizeof(servaddr));
-
-        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd < 0) err(1, "socket()");
-
         servaddr.sin_family = AF_INET;
         servaddr.sin_addr.s_addr = getaddr(address);
         servaddr.sin_port = htons(port);
 
-        if(bind(listen_fd, (struct sockaddr*) &servaddr, sizeof(servaddr)) < 0) err(1, "bind()");
-
-        if(listen(listen_fd, 500) < 0) err(1, "listen()");
-
-        struct thread_data thread_data_array[threadCount];
-
-        pthread_t *threadId = (pthread_t *)malloc(sizeof(pthread_t) * threadCount);
-        for (int i = 0; i < threadCount; i++) { 
-                thread_data_array[i].redundancyStatus = redundancyStatus;
-                int wThreads = pthread_create(&threadId[i], NULL, worker_thread, &thread_data_array[i]);
-                printf("thread %d created. Waiting\n", i);
-                if (wThreads < 0) {
-                        warn("%s", "Error while using pthread_create");
-                        return 1;
-                }
+        if (::bind(listen_fd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+                err(1, "bind()");
         }
-        availableThreads = threadCount;
-
-        while(1) {
-                printf("waiting...\n");
-                int header = accept(listen_fd, NULL, NULL);
-
-                if (header == -1) {
-                        warn("%s", "accept error");
-                        return 1;
-                }
-
-                pthread_mutex_lock(&mutexQue);
-                headerQueue.push(header);
-                pthread_mutex_unlock(&mutexQue);
-                
-                pthread_mutex_lock(&mutexAvailable);
-
-                while (availableThreads == 0) {
-                        //sleep while no available threads
-                        pthread_mutex_unlock(&mutexAvailable);
-                        pthread_cond_wait(&condDispatch, &mutexDispatch);
-                        pthread_mutex_lock(&mutexAvailable);
-                }
-                pthread_mutex_unlock(&mutexAvailable);
-                pthread_cond_signal(&condThread);
+        if (listen(listen_fd, 500) < 0) {
+                err(1, "listen()");
         }
 
+        ThreadData thread_data;
+        thread_data.redundancy_enabled = redundancy_enabled;
+
+        std::vector<pthread_t> thread_ids((size_t)workers);
+        for (int i = 0; i < workers; ++i) {
+                if (pthread_create(&thread_ids[(size_t)i], NULL, worker_thread, &thread_data) != 0) {
+                        err(1, "pthread_create()");
+                }
+        }
+
+        while (true) {
+                int client_fd = accept(listen_fd, NULL, NULL);
+                if (client_fd == -1) {
+                        warn("accept()");
+                        continue;
+                }
+
+                pthread_mutex_lock(&queue_mutex);
+                client_queue.push(client_fd);
+                pthread_cond_signal(&queue_ready);
+                pthread_mutex_unlock(&queue_mutex);
+        }
 }
